@@ -1,0 +1,231 @@
+---
+title: "R code ski"
+format: html
+editor: visual
+---
+
+```{r}
+#packages
+
+library(tidyverse)
+library(tinytex)
+library(ggfortify)
+library(dplyr)
+library(car) 
+library(corrplot) 
+library(patchwork)
+library(bestglm)
+library(MASS)
+library(glmnet)
+library(xtable)
+```
+
+```{r}
+
+# Read in the data
+
+ski<-read.csv("resorts.csv", 
+              header = TRUE)
+
+# Convert categorical variables to factors
+ski <- ski %>%
+  mutate(across(where(is.character), as.factor))
+
+# Convert integer variables to numerics
+
+ski <- ski %>%
+  mutate(across(where(is.integer), as.numeric))
+
+#Convert Price variable to USD (using conversion rate for Euros to USD)
+
+ski$Price <- .92*ski$Price
+
+# Create a new variable called "region" which sorts the resorts into the main regions we want to look at, while ommitting the others
+
+ski_regions <- ski %>%
+  mutate(region = case_when(
+    Country %in% c("Austria", "Switzerland", "France", "Italy", "Germany", "Liechtenstein", "Slovenia") ~ "Alpine Europe",
+    Country %in% c("Finland", "Norway", "Sweden") ~ "Scandinavia",
+    Country %in% c("Japan", "China", "South Korea", "Iran", "Kazakhstan", "Lebanon") ~ "Asia",
+    Country %in% c("United States", "Canada") ~ "North America",
+    TRUE ~ NA_character_  # Mark other countries as NA
+  )) %>%
+  filter(!is.na(region)) %>%  # Keep only the selected regions
+  mutate(region = factor(region, levels = c("Alpine Europe", "Scandinavia", "Asia", "North America")))
+
+# Create a new variable called perc_dif that tells us what percent of the slops are difficult
+
+ski_regions$perc_dif <- ski_regions$Difficult.slopes/ski_regions$Total.slopes
+
+summary(ski_regions)
+```
+
+```{r}
+
+#Looking at correlation matrix and plot to determine if Multicollinearity is an issue
+
+corr_matrix <- cor(ski_regions[sapply(ski_regions, is.numeric)])
+
+high_corr <- which(abs(corr_matrix) > 0.8, arr.ind = TRUE)
+
+# Extract variable names and correlation values
+high_corr_values <- corr_matrix[high_corr]
+high_corr_names <- data.frame(
+  Var1 = rownames(corr_matrix)[high_corr[, 1]],
+  Var2 = colnames(corr_matrix)[high_corr[, 2]],
+  Correlation = high_corr_values
+)
+
+# View the results
+print(high_corr_names)
+
+#Omit highly correlated or irrelevant columns
+ski_regions <- dplyr::select(ski_regions, -c("Country", "Continent", "Latitude", "Longitude", "Child.friendly", "Surface.lifts", "Gondola.lifts", "Chair.lifts", "Beginner.slopes", "Intermediate.slopes", "Snowparks", "Snow.cannons", "Difficult.slopes", "Total.slopes", "Resort", "ID",  "Total.lifts", "Season"))
+
+```
+
+```{r}
+
+# Tried testing all possible subsets, but there are too many predictors so it was too difficult for R to calculate
+
+#Create a regression model using stepwise selction with AIC as a metric
+
+step_model <- stepAIC(lm(Price ~ ., data = ski_regions), direction = "both")
+
+# This is the best model
+
+step_model$call
+
+# Saving that model
+
+stepAIC_model<- lm(Price~Highest.point + Longest.run + Lift.capacity + region, ski_regions)
+
+summary(stepAIC_model)
+```
+
+```{r}
+# Trying LASSO Regression
+
+# Assigning predictors and Response
+
+ski_regions_x <- model.matrix(Price ~ . - 1, data = ski_regions) 
+ski_regions_y <- ski_regions$Price 
+
+# Perform cross-validation
+set.seed(12345)
+
+ski_lasso_cv <- cv.glmnet(x = ski_regions_x,
+                          y = ski_regions_y, 
+                          type.measure = "mse", 
+                          alpha = 1)
+
+# Getting the best lambda value using 1se rule
+lambda_1se <- ski_lasso_cv$lambda.1se
+
+# Extracting coefficients corresponding to lambda_1se
+coefficients_1se <- coef(ski_lasso_cv, s = lambda_1se)
+
+print(coefficients_1se)
+
+# Create a LASSO model object using the selected lambda
+lasso_model <- glmnet(x = ski_regions_x, y = ski_regions_y, alpha = 1, lambda = lambda_1se)
+
+final_lm<- lm(Price~Highest.point+Longest.run+Lift.capacity+region, data=ski_regions)
+
+summary(final_lm)
+```
+
+```{r}
+# Checking whether we should included an interaction term
+
+# Adding predictions to the dataset
+ski_regions$predicted_pass_price <- predict(ski_lasso_cv$glmnet.fit, 
+                                            newx = ski_regions_x, 
+                                            s = lambda_1se)
+
+#Looking at pairwise plots to see if there are any obvious interations
+
+ggplot(ski_regions) +
+  geom_point(mapping = aes(x = Highest.point, y = Price, color = region)) +
+  geom_smooth(mapping = aes(x = Highest.point, y = predicted_pass_price, color = region)) 
+  theme(aspect.ratio = 1)
+
+  ggplot(ski_regions) +
+  geom_point(mapping = aes(x = Longest.run, y = Price, color = region)) +
+  geom_smooth(mapping = aes(x = Longest.run, y = predicted_pass_price, color = region)) 
+  theme(aspect.ratio = 1)
+  
+  ggplot(ski_regions) +
+  geom_point(mapping = aes(x = Lift.capacity, y = Price, color = region)) +
+  geom_smooth(mapping = aes(x = Lift.capacity, y = predicted_pass_price, color = region)) 
+  theme(aspect.ratio = 1)
+  
+# The slope is about the same across all regions, so no interaction term is necessary
+```
+
+```{r}
+
+# Confidence intervals for the coefficients
+
+coef_estimates <- coef(final_lm)
+conf_intervals <- confint(final_lm)
+
+results_table <- data.frame(
+  Coefficient = names(coef_estimates),
+  Estimate = sprintf("%.5f", coef_estimates), 
+  `Confidence Interval` = paste0("(", round(conf_intervals[, 1], 5), ", ", round(conf_intervals[, 2], 5), ")")
+)
+
+# Create the table
+results_xtable <- xtable(results_table, caption = "Coefficients and Confidence Intervals for Linear Model")
+
+# Print the table in LaTeX format
+print(results_xtable, include.rownames = FALSE)
+
+
+#prediction interval for our potential resort, by region
+
+
+region_levels <- levels(ski_regions$region)
+
+
+highest_point <- 2500
+longest_run <- 3.74
+lift_capacity <- 30228
+
+
+new_resorts <- lapply(region_levels, function(region) {
+  data.frame(
+    Highest.point = highest_point,
+    Longest.run = longest_run,
+    Lift.capacity = lift_capacity,
+    region = factor(region, levels = region_levels)
+  )
+})
+
+
+new_resorts <- do.call(rbind, new_resorts)
+
+
+prediction_intervals <- predict(final_lm, newdata = new_resorts, interval = "prediction")
+
+
+results_table <- data.frame(
+  Region = new_resorts$region,
+  Fit = round(prediction_intervals[, "fit"], 3),
+  Lower = round(prediction_intervals[, "lwr"], 3),
+  Upper = round(prediction_intervals[, "upr"], 3)
+)
+
+
+#table of these predictions
+
+results_xtable <- xtable(
+  results_table, 
+  caption = "Prediction Intervals for Ski Resorts in Different Regions",
+  align = c("l", "l", "r", "r", "r")
+)
+
+print(results_xtable, include.rownames = FALSE)
+
+```
